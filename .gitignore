@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.bak
+*.log
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+.env
+.env.*
+.DS_Store
+__MACOSX/
+.idea/
+.vscode/
