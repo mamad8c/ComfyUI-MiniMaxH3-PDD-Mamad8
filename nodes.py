@@ -10,6 +10,7 @@ from .pdd_grid import (
     AUDIO_SHIFT,
     BLOCK_TOLERANCE,
     VIDEO_SHIFT,
+    auto_partition_knots,
     build_grid,
     parse_partition_knots,
     scheduler_sigmas,
@@ -82,12 +83,15 @@ def create_extension():
                         max=256,
                         optional=True,
                         tooltip=(
-                            "Transformer calls to fuse the file into. 0 keeps the "
-                            "file's native count. Displacement fusion is additive, so "
-                            "any divisor of the file's native count is exact (an "
-                            "nfe16 file with blocks=4 equals the production 4-call "
-                            "fusion). Values above the file's native count need a "
-                            "finer artifact and fail closed."
+                            "Transformer calls to fuse the artifact into. 0 keeps a "
+                            "fused file's native count (raw banks default to 4). On "
+                            "a raw interval bank ANY integer 1..256 works: divisors "
+                            "of 256 fuse uniformly like the shipped exports, other "
+                            "counts derive an anchored partition that preserves the "
+                            "trained launch knots and splits the largest weighted "
+                            "sigma spans (blocks=5 gives 0|64|128|192|240|256). "
+                            "Fused files only re-fuse to divisors of their own "
+                            "count; other values need the bank and fail closed."
                         ),
                     ),
                     io.String.Input(
@@ -352,11 +356,19 @@ def create_extension():
                 # Default a bank to the production 4-call fusion; 0 would mean a
                 # surprising 256-call schedule.
                 chosen = blocks or 4
-                if chosen < 1 or chosen > num_intervals or num_intervals % chosen:
+                if chosen < 1 or chosen > num_intervals:
                     raise ValueError(
-                        f"blocks={chosen} must divide the bank's {num_intervals} intervals"
+                        f"blocks={chosen} must be within 1..{num_intervals} for a bank"
                     )
-                knots = list(range(0, num_intervals + 1, num_intervals // chosen))
+                if num_intervals % chosen == 0:
+                    # Divisors keep the uniform meaning established by the
+                    # shipped 4/8/16 exports.
+                    knots = list(range(0, num_intervals + 1, num_intervals // chosen))
+                else:
+                    # Any other integer derives an anchored partition: trained
+                    # launch knots preserved, extra cuts split the largest
+                    # loss-weighted sigma spans (the late blocks).
+                    knots = auto_partition_knots(grid, chosen)
 
             deltas_video = torch.tensor(grid.deltas_video, dtype=torch.float64)
             deltas_audio = torch.tensor(grid.deltas_audio, dtype=torch.float64)

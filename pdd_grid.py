@@ -169,6 +169,56 @@ def parse_partition_knots(text, num_intervals: int):
     return knots
 
 
+def auto_partition_knots(
+    grid: PDDGrid,
+    nfe: int,
+    anchors: tuple[int, ...] = (0, 64, 128, 192, 256),
+    video_weight: float = 0.7,
+    audio_weight: float = 0.3,
+) -> list[int]:
+    """Derive cut knots for any block count from the trained anchor partition.
+
+    Above the anchor count, the block with the largest loss-weighted sigma span
+    is repeatedly split at the knot that best halves that span — extra calls
+    therefore land where the trained trajectory covers the most weighted sigma
+    (in practice the late blocks). Below it, the interior anchor whose removal
+    creates the smallest merged span is repeatedly dropped. Anchor launch
+    states are preserved whenever the count allows, matching how the bank was
+    trained (blocks launched only from anchor knots).
+    """
+
+    nfe = int(nfe)
+    if nfe < 1 or nfe > grid.num_intervals:
+        raise ValueError(f"nfe must be within 1..{grid.num_intervals}, got {nfe}")
+
+    def wspan(left: int, right: int) -> float:
+        return video_weight * (
+            grid.sigmas_video[left] - grid.sigmas_video[right]
+        ) + audio_weight * (grid.sigmas_audio[left] - grid.sigmas_audio[right])
+
+    knots = [k for k in anchors if 0 <= k <= grid.num_intervals]
+    while len(knots) - 1 > nfe:
+        candidates = range(1, len(knots) - 1)
+        drop = min(candidates, key=lambda i: wspan(knots[i - 1], knots[i + 1]))
+        del knots[drop]
+    while len(knots) - 1 < nfe:
+        widths = [
+            (wspan(knots[i], knots[i + 1]), i)
+            for i in range(len(knots) - 1)
+            if knots[i + 1] - knots[i] >= 2
+        ]
+        if not widths:
+            raise ValueError(f"cannot reach nfe={nfe}: no splittable block left")
+        _, index = max(widths)
+        left, right = knots[index], knots[index + 1]
+        cut = min(
+            range(left + 1, right),
+            key=lambda c: abs(wspan(left, c) - wspan(c, right)),
+        )
+        knots.insert(index + 1, cut)
+    return knots
+
+
 def select_block(
     sigma: float,
     boundaries: tuple[float, ...] | list[float],
