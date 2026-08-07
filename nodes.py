@@ -56,16 +56,17 @@ def create_extension():
     import comfy.utils
     from comfy.ldm.minimax.model import MiniMaxH3Model
     try:
+        # Pre-88fec4b ComfyUI: the model multiplies the audio stream's returned
+        # velocity by this slope so the flat video-schedule ODE integrates it.
         from comfy.ldm.minimax.model import time_shift_slope
+        upstream_scales_audio_velocity = True
     except ImportError:
-        # Upstream removed the helper in 88fec4b (2026-08-06); this is its
-        # exact original formula: d(sigma_to)/d(sigma_from) at the same
-        # base-grid point.
-        def time_shift_slope(sigma, from_shift, to_shift):
-            base = sigma / (from_shift + sigma * (1.0 - from_shift))
-            return (to_shift * (1.0 + (from_shift - 1.0) * base) ** 2) / (
-                from_shift * (1.0 + (to_shift - 1.0) * base) ** 2
-            )
+        # 88fec4b+ ComfyUI (ModelSamplingAV): the sampler carries the audio
+        # latent scaled onto the video schedule, the network sees the true
+        # audio stream and must return true audio velocity; the model's outer
+        # forward performs the carried-variable conversion itself.
+        time_shift_slope = None
+        upstream_scales_audio_velocity = False
     from comfy_api.latest import ComfyExtension, io
 
     heads_dir = os.path.join(folder_paths.models_dir, "pdd_heads")
@@ -681,14 +682,33 @@ def create_extension():
                                             device=displacement_video.device,
                                             dtype=displacement_video.dtype,
                                         )
-                                        slope_audio = time_shift_slope(
-                                            holder.sigma_v.to(displacement_audio.device),
-                                            holder.shift_video,
-                                            holder.shift_audio,
-                                        ).to(displacement_audio.dtype)
+                                        if upstream_scales_audio_velocity:
+                                            slope_audio = time_shift_slope(
+                                                holder.sigma_v.to(displacement_audio.device),
+                                                holder.shift_video,
+                                                holder.shift_audio,
+                                            ).to(displacement_audio.dtype)
+                                            audio_velocity = displacement_audio / (
+                                                dsig_video * slope_audio
+                                            )
+                                        else:
+                                            # ModelSamplingAV carries the audio latent as
+                                            # carry(sigma) * audio with the affine carry
+                                            # s + (1 - s) * sigma_v (s = shift_v/shift_a).
+                                            # Solving one Euler step of the carried
+                                            # variable for the trained block displacement
+                                            # gives displacement * carry_now * carry_next
+                                            # / (s * dsig_v) as the required true audio
+                                            # velocity.
+                                            ratio = holder.shift_video / holder.shift_audio
+                                            carry_now = ratio + (1.0 - ratio) * sigma_float
+                                            carry_next = ratio + (1.0 - ratio) * next_sigma
+                                            audio_velocity = displacement_audio * (
+                                                carry_now * carry_next / ratio
+                                            ) / dsig_video.to(displacement_audio.dtype)
                                         return blend_with_native(
                                             displacement_video / dsig_video,
-                                            displacement_audio / (dsig_video * slope_audio),
+                                            audio_velocity,
                                         )
 
                 # Exact mode deliberately falls back here for inner evaluations from
