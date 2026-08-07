@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from types import SimpleNamespace
@@ -53,7 +54,18 @@ def create_extension():
     import torch.nn.functional as functional
     import comfy.patcher_extension
     import comfy.utils
-    from comfy.ldm.minimax.model import MiniMaxH3Model, time_shift_slope
+    from comfy.ldm.minimax.model import MiniMaxH3Model
+    try:
+        from comfy.ldm.minimax.model import time_shift_slope
+    except ImportError:
+        # Upstream removed the helper in 88fec4b (2026-08-06); this is its
+        # exact original formula: d(sigma_to)/d(sigma_from) at the same
+        # base-grid point.
+        def time_shift_slope(sigma, from_shift, to_shift):
+            base = sigma / (from_shift + sigma * (1.0 - from_shift))
+            return (to_shift * (1.0 + (from_shift - 1.0) * base) ** 2) / (
+                from_shift * (1.0 + (to_shift - 1.0) * base) ** 2
+            )
     from comfy_api.latest import ComfyExtension, io
 
     heads_dir = os.path.join(folder_paths.models_dir, "pdd_heads")
@@ -466,6 +478,22 @@ def create_extension():
                             "1.0 is the trained PDD path; values other than 1.0 are experimental."
                         ),
                     ),
+                    io.Combo.Input(
+                        "contract",
+                        options=["enforce", "warn_only"],
+                        default="enforce",
+                        optional=True,
+                        tooltip=(
+                            "enforce fails closed on any trained-contract violation "
+                            "(sigma shift not 12/3, exact-mode steps not spanning "
+                            "exactly one block). warn_only runs the experiment "
+                            "anyway: one console warning per violation, audio slope "
+                            "computed from the live shifts, and off-block exact "
+                            "steps fall back to block-velocity conversion. Outputs "
+                            "under warn_only are off-distribution by definition — "
+                            "judge them as experiments, not as the artifact."
+                        ),
+                    ),
                 ],
                 outputs=[io.Model.Output()],
             )
@@ -478,7 +506,16 @@ def create_extension():
             mode="exact_euler_step",
             on_out_of_grid="clamp",
             head_strength=1.0,
+            contract="enforce",
         ):
+            if contract not in {"enforce", "warn_only"}:
+                raise ValueError(f"Unsupported PDD contract {contract!r}")
+            warned = set()
+
+            def warn_once(key, message):
+                if key not in warned:
+                    warned.add(key)
+                    logging.warning("MiniMaxH3-PDD experimental: %s", message)
             if not isinstance(pdd_heads, PDDHeads):
                 raise TypeError("pdd_heads is not a validated PDD_HEADS object")
             if mode not in {"exact_euler_step", "block_velocity"}:
@@ -494,7 +531,10 @@ def create_extension():
             if not isinstance(diffusion_model, MiniMaxH3Model):
                 raise RuntimeError("MiniMaxH3PDDModelPatch can only patch a MiniMax H3 model")
 
-            holder = SimpleNamespace(sigma_v=None, transformer_options=None)
+            holder = SimpleNamespace(
+                sigma_v=None, transformer_options=None,
+                shift_video=VIDEO_SHIFT, shift_audio=AUDIO_SHIFT,
+            )
 
             def diffusion_wrapper(executor, *args, **kwargs):
                 timestep = args[1] if len(args) > 1 else kwargs.get("timestep")
@@ -518,10 +558,21 @@ def create_extension():
                     math.isclose(shift_video, VIDEO_SHIFT, rel_tol=0.0, abs_tol=1.0e-9)
                     and math.isclose(shift_audio, AUDIO_SHIFT, rel_tol=0.0, abs_tol=1.0e-9)
                 ):
-                    raise ValueError(
-                        "MiniMax H3 PDD heads require MiniMaxH3SigmaShift values "
-                        f"12.0/3.0, got {shift_video}/{shift_audio}"
+                    if contract == "enforce":
+                        raise ValueError(
+                            "MiniMax H3 PDD heads require MiniMaxH3SigmaShift values "
+                            f"12.0/3.0, got {shift_video}/{shift_audio}. Set the "
+                            "patch contract to warn_only to run this as an "
+                            "off-distribution experiment."
+                        )
+                    warn_once(
+                        "shift",
+                        f"running trained-at-12.0/3.0 heads under shifts "
+                        f"{shift_video}/{shift_audio}; features and audio spans are "
+                        "off-distribution (audio slope follows the live shifts)",
                     )
+                holder.shift_video = shift_video
+                holder.shift_audio = shift_audio
                 holder.sigma_v = (timestep.flatten()[0] / 1000.0).float()
                 holder.transformer_options = transformer_options
                 try:
@@ -601,34 +652,44 @@ def create_extension():
                                         range(len(bounds) - 1),
                                         key=lambda i: abs(sigma_float - bounds[i]),
                                     )
-                                    if (
-                                        abs(sigma_float - bounds[nearest]) > BLOCK_TOLERANCE
-                                        or abs(next_sigma - bounds[nearest + 1]) > BLOCK_TOLERANCE
-                                    ):
-                                        raise ValueError(
-                                            "exact_euler_step needs every sampler step to "
-                                            "span exactly one trained block; step "
-                                            f"{sigma_float:.6g} -> {next_sigma:.6g} does not "
-                                            "match consecutive artifact boundaries "
-                                            f"[{', '.join(f'{v:.6g}' for v in bounds)}]. Use "
-                                            "the PDD scheduler in trained_blocks mode (or a "
-                                            "matching blocks/partition on the loader), or "
-                                            "switch the patch to block_velocity for "
-                                            "arbitrary schedules."
+                                    aligned = (
+                                        abs(sigma_float - bounds[nearest]) <= BLOCK_TOLERANCE
+                                        and abs(next_sigma - bounds[nearest + 1]) <= BLOCK_TOLERANCE
+                                    )
+                                    if not aligned:
+                                        if contract == "enforce":
+                                            raise ValueError(
+                                                "exact_euler_step needs every sampler step to "
+                                                "span exactly one trained block; step "
+                                                f"{sigma_float:.6g} -> {next_sigma:.6g} does not "
+                                                "match consecutive artifact boundaries "
+                                                f"[{', '.join(f'{v:.6g}' for v in bounds)}]. Use "
+                                                "the PDD scheduler in trained_blocks mode (or a "
+                                                "matching blocks/partition on the loader), switch "
+                                                "the patch to block_velocity, or set contract to "
+                                                "warn_only to experiment."
+                                            )
+                                        warn_once(
+                                            "schedule",
+                                            f"schedule step {sigma_float:.6g} -> "
+                                            f"{next_sigma:.6g} does not span one trained "
+                                            "block; using block-velocity conversion for "
+                                            "such steps",
                                         )
-                                    dsig_video = dsig.to(
-                                        device=displacement_video.device,
-                                        dtype=displacement_video.dtype,
-                                    )
-                                    slope_audio = time_shift_slope(
-                                        holder.sigma_v.to(displacement_audio.device),
-                                        VIDEO_SHIFT,
-                                        AUDIO_SHIFT,
-                                    ).to(displacement_audio.dtype)
-                                    return blend_with_native(
-                                        displacement_video / dsig_video,
-                                        displacement_audio / (dsig_video * slope_audio),
-                                    )
+                                    if aligned:
+                                        dsig_video = dsig.to(
+                                            device=displacement_video.device,
+                                            dtype=displacement_video.dtype,
+                                        )
+                                        slope_audio = time_shift_slope(
+                                            holder.sigma_v.to(displacement_audio.device),
+                                            holder.shift_video,
+                                            holder.shift_audio,
+                                        ).to(displacement_audio.dtype)
+                                        return blend_with_native(
+                                            displacement_video / dsig_video,
+                                            displacement_audio / (dsig_video * slope_audio),
+                                        )
 
                 # Exact mode deliberately falls back here for inner evaluations from
                 # multi-evaluation samplers or for missing/non-descending schedules.
